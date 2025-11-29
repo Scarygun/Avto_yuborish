@@ -207,3 +207,4 @@ Telegram Auto-Messaging Bot
 
 Savollar bo'lsa, issue oching yoki admin bilan bog'laning.
 # Avto_yuborish
+# Avto_yuborish
