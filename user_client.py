@@ -33,8 +33,15 @@ async def send_message_to_chat(chat_id: int, text: str):
         raise RuntimeError("User client not started. Call start_user_client() first.")
     
     try:
+        # Chat nomini olish (log uchun)
+        try:
+            entity = await user_client.get_entity(chat_id)
+            title = getattr(entity, 'title', getattr(entity, 'username', str(chat_id)))
+        except:
+            title = str(chat_id)
+
         await user_client.send_message(chat_id, text)
-        logger.info(f"Message sent to {chat_id} via user client")
+        logger.info(f"Message sent to '{title}' ({chat_id}) via user client")
         return True, "Message sent"
     except Exception as e:
         logger.error(f"Failed to send message to {chat_id}: {e}")

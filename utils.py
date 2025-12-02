@@ -1,6 +1,7 @@
 import logging
 from functools import wraps
 from datetime import datetime
+from telethon.tl.types import User
 import config
 
 # Logging sozlash
@@ -65,6 +66,78 @@ def validate_message_text(text):
     if len(text) > 4096:  # Telegram limit
         return False, "Xabar matni 4096 belgidan oshmasligi kerak"
     return True, text.strip()
+
+
+def safe_execute(cursor, sql, params=None, retries=3, delay=2):
+    """Execute SQL with retry on sqlite3.OperationalError (e.g., database is locked).
+    Args:
+        cursor: sqlite3.Cursor object.
+        sql: SQL statement.
+        params: Optional parameters for the SQL.
+        retries: Number of retry attempts.
+        delay: Seconds to wait between retries.
+    Returns:
+        None. Raises the last exception if all retries fail.
+    """
+    import sqlite3, time
+    for attempt in range(retries):
+        try:
+            if params:
+                cursor.execute(sql, params)
+            else:
+                cursor.execute(sql)
+            break
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < retries - 1:
+                logger.warning(f"SQLite locked, retrying {attempt + 1}/{retries} after {delay}s")
+                time.sleep(delay)
+            else:
+                logger.error(f"SQLite operation failed after {attempt + 1} attempts: {e}")
+                raise
+def patch_telethon_sqlite():
+    """Monkey‑patch Telethon's SQLiteSession to use safe_execute for updates.
+    The original Telethon SQLiteSession does not expose a _connect attribute, so we only
+    replace the _update_session_table method to include retry logic via safe_execute.
+    """
+    try:
+        from telethon.sessions import SQLiteSession
+    except ImportError as e:
+        logger.error(f"Failed to import Telethon SQLiteSession for patching: {e}")
+        return
+
+    # Replace the session table update with safe_execute and avoid hard crashes
+    # when the SQLite database is temporarily locked by another process.
+    def new_update_session_table(self):
+        import sqlite3
+        # Ensure the connection is initialized the same way Telethon does
+        c = self._cursor()
+        try:
+            try:
+                # Use a single upsert instead of delete+insert to reduce locking
+                safe_execute(
+                    c,
+                    'insert or replace into sessions values (?,?,?,?,?)',
+                    (
+                        self._dc_id,
+                        self._server_address,
+                        self._port,
+                        self._auth_key.key if self._auth_key else b'',
+                        self._takeout_id,
+                    ),
+                )
+                # Explicitly commit after successful update
+                self._conn.commit()
+            except sqlite3.OperationalError as e:
+                # Log but do not crash the whole application on a transient lock
+                logger.error(f"Kritik xatolik: {e}")
+        finally:
+            c.close()
+
+    SQLiteSession._update_session_table = new_update_session_table
+    logger.info("Telethon SQLiteSession patched with safe_execute for session updates.")
+
+# Apply the patch at import time
+patch_telethon_sqlite()
 
 # Pagination uchun
 def paginate_list(items, page=1, per_page=10):
@@ -157,6 +230,11 @@ async def check_group_membership(user_client, group_link):
             logger.error(f"Guruhni topishda xatolik ({username}): {e}")
             return False, None, f"Guruh topilmadi: {str(e)}"
         
+        # Entity User ekanligini tekshirish
+        if isinstance(entity, User):
+            logger.warning(f"Topilgan entity User: {username} (ID: {entity.id})")
+            return False, entity.id, "Bu guruh emas, foydalanuvchi"
+        
         # A'zolikni tekshirish - get_permissions orqali
         try:
             participant = await user_client.get_permissions(entity)
@@ -167,6 +245,7 @@ async def check_group_membership(user_client, group_link):
                 return False, entity.id, "Guruhda ban qilingan"
             
             # Agar participant mavjud bo'lsa va ban bo'lmasa, demak a'zo
+            
             return True, entity.id, None
             
         except Exception as perm_error:

@@ -6,8 +6,8 @@ from database import init_db
 from models import User, Group, Message
 from telegram_client import telegram_manager
 from message_sender import message_sender
-from scheduler import task_scheduler
-from utils import logger, validate_phone, validate_interval_hours, validate_message_text, format_stats, load_configured_groups, check_group_membership
+
+from utils import logger, validate_phone, validate_message_text, format_stats, load_configured_groups, check_group_membership
 from user_client import start_user_client, send_message_to_chat
 import asyncio
 
@@ -61,10 +61,7 @@ async def help_handler(event):
         "**2. Xabar yuborish:**\n"
         "/send_message - Xabar matnini kiriting\n"
         "Barcha guruhlarga 5 minut interval bilan yuboriladi\n\n"
-        "**3. Rejalashtirish:**\n"
-        "/schedule_message - Xabar va interval (soat) kiriting\n"
-        "Masalan: har 2 soatda bir marta\n\n"
-        "**4. Tarix va statistika:**\n"
+        "**3. Tarix va statistika:**\n"
         "/history - Yuborilgan xabarlar\n"
         "/stats - Muvaffaqiyatli/muvaffaqiyatsiz xabarlar\n\n"
         "Savollar bo'lsa, admin bilan bog'laning."
@@ -219,9 +216,10 @@ async def send_message_handler(event):
         user = User.get_by_telegram_id(telegram_id)
     
     groups = Group.get_by_user_id(user['id'], active_only=True)
+    cfg_groups = load_configured_groups()
     
-    if not groups:
-        await event.respond("❌ Guruhlar yo'q. Botni guruhlaringizga qo'shing.")
+    if not groups and not cfg_groups:
+        await event.respond("❌ Guruhlar yo'q. Botni guruhlaringizga qo'shing yoki groups.json faylini tekshiring.")
         return
     
     await event.respond(
@@ -229,94 +227,6 @@ async def send_message_handler(event):
         "(Emoji va formatlash ishlatishingiz mumkin)"
     )
     user_states[telegram_id] = {'state': 'waiting_message_text'}
-
-async def schedule_message_handler(event):
-    """Xabar rejalashtirish"""
-    telegram_id = event.sender_id
-    
-    # Foydalanuvchini tekshirish
-    user = User.get_by_telegram_id(telegram_id)
-    if not user:
-        User.create(telegram_id=telegram_id)
-        user = User.get_by_telegram_id(telegram_id)
-    
-    groups = Group.get_by_user_id(user['id'], active_only=True)
-    
-    if not groups:
-        await event.respond("❌ Guruhlar yo'q. Botni guruhlaringizga qo'shing.")
-        return
-    
-    await event.respond(
-        "📝 Yubormoqchi bo'lgan xabar matnini kiriting:"
-    )
-    user_states[telegram_id] = {'state': 'waiting_schedule_text'}
-
-async def my_schedules_handler(event):
-    """Rejalashtirilgan vazifalar"""
-    telegram_id = event.sender_id
-    
-    tasks, error = await task_scheduler.get_user_tasks(telegram_id)
-    if error:
-        await event.respond(f"❌ {error}")
-        return
-    
-    if not tasks:
-        await event.respond("❌ Rejalashtirilgan vazifalar yo'q.")
-        return
-    
-    text = "📅 **Rejalashtirilgan vazifalar:**\n\n"
-    for i, task in enumerate(tasks, 1):
-        next_run = task['next_run']
-        if isinstance(next_run, str):
-            from datetime import datetime
-            next_run = datetime.fromisoformat(next_run)
-        
-        text += (
-            f"{i}. ID: {task['id']}\n"
-            f"   Interval: {task['interval_hours']} soat\n"
-            f"   Keyingi yuborish: {next_run.strftime('%Y-%m-%d %H:%M')} UTC\n"
-            f"   Matn: {task['message_text'][:50]}...\n\n"
-        )
-    
-    await event.respond(text)
-
-async def cancel_schedule_handler(event):
-    """Vazifani bekor qilish"""
-    telegram_id = event.sender_id
-    
-    tasks, error = await task_scheduler.get_user_tasks(telegram_id)
-    if error:
-        await event.respond(f"❌ {error}")
-        return
-    
-    if not tasks:
-        await event.respond("❌ Rejalashtirilgan vazifalar yo'q.")
-        return
-    
-    # Inline tugmalar
-    buttons = []
-    for task in tasks:
-        buttons.append([Button.inline(
-            f"❌ {task['message_text'][:30]} ({task['interval_hours']}h)",
-            data=f"cancel_schedule:{task['id']}"
-        )])
-    
-    await event.respond(
-        "Bekor qilmoqchi bo'lgan vazifani tanlang:",
-        buttons=buttons
-    )
-
-async def cancel_schedule_callback(event):
-    """Vazifani bekor qilish callback"""
-    telegram_id = event.sender_id
-    data = event.data.decode('utf-8')
-    _, task_id = data.split(':')
-    task_id = int(task_id)
-    
-    success, message = await task_scheduler.cancel_task(telegram_id, task_id)
-    await event.answer(message)
-    if success:
-        await event.respond(message)
 
 async def history_handler(event):
     """Yuborilgan xabarlar tarixi"""
@@ -427,6 +337,25 @@ async def send_type_callback(event):
                     'link': group_link
                 })
                 logger.info(f"✅ A'zo: {group_name} (ID: {chat_id})")
+                
+                # Guruhni bazaga saqlash (agar yo'q bo'lsa)
+                existing_groups = Group.get_by_user_id(user['id'], active_only=False)
+                existing = None
+                for g in existing_groups:
+                    if g['group_id'] == chat_id:
+                        existing = g
+                        break
+                
+                if existing:
+                    if not existing['is_active']:
+                        Group.update(existing['id'], is_active=True, group_name=group_name)
+                else:
+                    Group.create(
+                        user_id=user['id'],
+                        group_id=chat_id,
+                        group_name=group_name,
+                        group_username=group_link.split('/')[-1] if 't.me/' in group_link else None
+                    )
             else:
                 logger.warning(f"❌ A'zo emas: {group_name} - {error}")
         
@@ -463,29 +392,6 @@ async def send_type_callback(event):
         )
         await event.respond(summary)
         user_states.pop(telegram_id, None)
-    
-    elif data == 'send_hourly':
-        # Har soatda takroriy yuborish - scheduler'ga qo'shish
-        from scheduler import task_scheduler
-        
-        # Xabarni rejalashtirish (har 1 soatda)
-        success, result_msg = await task_scheduler.add_scheduled_task(
-            telegram_id=telegram_id,
-            message_text=message_text,
-            interval_hours=1  # Har 1 soatda
-        )
-        
-        if success:
-            await event.respond(
-                f"✅ Takroriy yuborish rejalashtirildi!\n\n"
-                f"Xabar har 1 soatda barcha guruhlarga yuboriladi.\n\n"
-                f"/my_schedules - Rejalarni ko'rish\n"
-                f"/cancel_schedule - Bekor qilish"
-            )
-        else:
-            await event.respond(f"❌ {result_msg}")
-        
-        user_states.pop(telegram_id, None)
 
 # Oddiy xabarlarni qayta ishlash (conversation state)
 async def message_handler(event):
@@ -513,48 +419,14 @@ async def message_handler(event):
         from telethon import Button
         
         buttons = [
-            [Button.inline("1️⃣ Bir martalik yuborish", data=b'send_once')],
-            [Button.inline("2️⃣ Har 1 soatda takroriy yuborish", data=b'send_hourly')]
+            [Button.inline("🚀 Yuborish", data=b'send_once')]
         ]
         
         await event.respond(
-            "🔄 **Xabarni qanday yuborishni xohlaysiz?**",
+            "🔄 **Xabarni yuborishni tasdiqlaysizmi?**",
             buttons=buttons
         )
         return
-    
-    elif state == 'waiting_schedule_text':
-        # Rejalashtirish - matn
-        valid, result = validate_message_text(event.message.text)
-        if not valid:
-            await event.respond(f"❌ {result}")
-            return
-        
-        message_text = result
-        user_states[telegram_id] = {
-            'state': 'waiting_schedule_interval',
-            'message_text': message_text
-        }
-        await event.respond(
-            "⏰ Necha soatda bir marta yuborilsin?\n"
-            "Raqam kiriting (1-168 oralig'ida):"
-        )
-    
-    elif state == 'waiting_schedule_interval':
-        # Rejalashtirish - interval
-        interval_hours = validate_interval_hours(event.message.text)
-        if not interval_hours:
-            await event.respond("❌ Noto'g'ri qiymat. 1 dan 168 gacha raqam kiriting.")
-            return
-        
-        message_text = user_states[telegram_id].get('message_text')
-        success, message = await task_scheduler.add_scheduled_task(
-            telegram_id,
-            message_text,
-            interval_hours
-        )
-        await event.respond(message)
-        user_states.pop(telegram_id, None)
 
 async def main():
     """Asosiy funksiya"""
@@ -591,8 +463,8 @@ async def main():
     # Ma'lumotlar bazasini yaratish
     init_db()
     
-    # Mavjud vazifalarni yuklash
-    await task_scheduler.load_existing_tasks()
+    # Ma'lumotlar bazasini yaratish
+
     
     logger.info("Bot ishga tushdi!")
     
@@ -612,8 +484,7 @@ async def main():
             await user_client.disconnect()
         except Exception as e:
             logger.error(f"User client disconnect xatolik: {e}")
-        # Agar botni to'xtatish paytida rejalashtirilgan vazifalarni to'xtatish
-        task_scheduler.shutdown()
+
 
 def setup_handlers():
     """Event handlerlarni sozlash"""
@@ -632,16 +503,11 @@ def setup_handlers():
     bot.add_event_handler(remove_group_handler, events.NewMessage(pattern='/remove_group'))
     bot.add_event_handler(remove_group_callback, events.CallbackQuery(pattern=b'remove_group:'))
     bot.add_event_handler(send_message_handler, events.NewMessage(pattern='/send_message'))
-    bot.add_event_handler(schedule_message_handler, events.NewMessage(pattern='/schedule_message'))
-    bot.add_event_handler(my_schedules_handler, events.NewMessage(pattern='/my_schedules'))
-    bot.add_event_handler(cancel_schedule_handler, events.NewMessage(pattern='/cancel_schedule'))
-    bot.add_event_handler(cancel_schedule_callback, events.CallbackQuery(pattern=b'cancel_schedule:'))
     bot.add_event_handler(history_handler, events.NewMessage(pattern='/history'))
     bot.add_event_handler(stats_handler, events.NewMessage(pattern='/stats'))
     
     # Callback handlers
     bot.add_event_handler(send_type_callback, events.CallbackQuery(pattern=b'send_once'))
-    bot.add_event_handler(send_type_callback, events.CallbackQuery(pattern=b'send_hourly'))
     
     # Note: message_handler is also a NewMessage handler. Telethon executes handlers in order.
     # If debug_handler is first, it runs first.
@@ -651,9 +517,9 @@ def setup_handlers():
 if __name__ == '__main__':
     try:
         asyncio.run(main())
+
     except KeyboardInterrupt:
         logger.info("Bot to'xtatilmoqda...")
-        task_scheduler.shutdown()
         # Bot va user client sessiyalarini yopish (agar hali yopilmagan bo'lsa)
         try:
             asyncio.run(bot.disconnect())
